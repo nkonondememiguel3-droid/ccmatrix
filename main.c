@@ -15,10 +15,28 @@
 #define CLEAR_SCREEN "\x1b[2J"
 #define RESET_COLOURS "\x1b[0m"
 
+#define COLOUR_HEAD "\x1b[0;1;37m"       /* bold white */
+#define COLOUR_TRAIL_NEAR "\x1b[0;1;32m" /* bold (bright) green */
+#define COLOUR_TRAIL_MID "\x1b[0;32m"    /* normal green */
+#define COLOUR_TRAIL_FAR "\x1b[0;2;32m"  /* dim green */
+
 #define FRAME_DELAY_MS 60
+#define TRAIL_MIN 6
+#define TRAIL_MAX 16
 
 static struct termios orig_terminal;
 static int raw_enabled = 0;
+
+/* buffer: build a whole frame, send it in one write */
+static char frame[8192];
+static size_t frame_len = 0;
+
+static void frame_append(const char *s, size_t len) {
+  if (frame_len + len > sizeof(frame))
+    return; /* frame too big; drop the rest rather than overflow */
+  memcpy(frame + frame_len, s, len);
+  frame_len += len;
+}
 
 static void write_str(const char *s) { write(STDOUT_FILENO, s, strlen(s)); }
 
@@ -46,7 +64,7 @@ static void enable_raw_mode(void) {
   raw.c_iflag &= ~(ICRNL | IXON | BRKINT | INPCK | ISTRIP);
   raw.c_oflag &= ~(OPOST);
   raw.c_cflag |= CS8;
-  raw.c_cc[VMIN] = 0;
+  raw.c_cc[VMIN] = 0; /* read() never blocks: returns 0 if no key */
   raw.c_cc[VTIME] = 0;
 
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
@@ -65,13 +83,23 @@ static void get_window_size(int *rows, int *cols) {
   *cols = ws.ws_col;
 }
 
-/* Draw c at (row, col); both are 1-based, as the terminal expects. */
-static void draw_at(int row, int col, char c) {
-  char buf[32];
-  int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH%c", row, col, c);
-  if (write(STDOUT_FILENO, buf, len) == -1)
-    die("write");
+/* Queue character c at (row, col) in the given colour; 1-based coordinates. */
+static void draw_at(int row, int col, const char *colour, char c) {
+  char buf[48];
+  int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH%s%c", row, col, colour, c);
+  frame_append(buf, (size_t)len);
 }
+
+/* Pick the trail colour by distance from the head (1 = just behind it). */
+static const char *trail_colour(int distance, int trail_len) {
+  if (distance <= 2)
+    return COLOUR_TRAIL_NEAR;
+  if (distance > trail_len - trail_len / 3)
+    return COLOUR_TRAIL_FAR;
+  return COLOUR_TRAIL_MID;
+}
+
+static char random_glyph(void) { return (char)('!' + rand() % 94); }
 
 static void sleep_ms(long ms) {
   struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
@@ -85,11 +113,16 @@ int main(void) {
   int rows, cols;
   get_window_size(&rows, &cols);
 
+  char *glyphs = calloc((size_t)rows + 1, 1);
+  if (!glyphs)
+    die("calloc");
+
   int col = rand() % cols + 1;
-  int row = 1;
+  int head = 1;
+  int trail_len = TRAIL_MIN + rand() % (TRAIL_MAX - TRAIL_MIN + 1);
 
   while (1) {
-    /* 1. Input: quit on 'q', ignore every other key. */
+
     char c;
     ssize_t n = read(STDIN_FILENO, &c, 1);
     if (n == -1 && errno != EAGAIN)
@@ -97,21 +130,39 @@ int main(void) {
     if (n == 1 && c == 'q')
       break;
 
-    /* 2. Update: erase the old position, draw the new one. */
-    if (row > 1)
-      draw_at(row - 1, col, ' ');
-    draw_at(row, col, 'm');
+    /* Draw the head, the trail behind it, and blank the cell after it. */
+    frame_len = 0;
 
-    /* 3. Move down; when past the bottom, start again in a new column. */
-    row++;
-    if (row > rows) {
-      draw_at(rows, col, ' ');
-      row = 1;
+    if (head <= rows) {
+      glyphs[head] = random_glyph();
+      draw_at(head, col, COLOUR_HEAD, glyphs[head]);
+    }
+
+    for (int d = 1; d <= trail_len; d++) {
+      int row = head - d;
+      if (row >= 1 && row <= rows)
+        draw_at(row, col, trail_colour(d, trail_len), glyphs[row]);
+    }
+
+    int tail_end = head - trail_len - 1;
+    if (tail_end >= 1 && tail_end <= rows)
+      draw_at(tail_end, col, RESET_COLOURS, ' ');
+
+    if (write(STDOUT_FILENO, frame, frame_len) == -1)
+      die("write");
+
+    /* Move down. Keep going until the whole trail has left the screen,
+          then start a new drop in a new column. */
+    head++;
+    if (head - trail_len - 1 > rows) {
+      head = 1;
       col = rand() % cols + 1;
+      trail_len = TRAIL_MIN + rand() % (TRAIL_MAX - TRAIL_MIN + 1);
     }
 
     sleep_ms(FRAME_DELAY_MS);
   }
 
-  return EXIT_SUCCESS; /* atexit -> restore_terminal() */
+  free(glyphs);
+  return EXIT_SUCCESS;
 }
