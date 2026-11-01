@@ -12,6 +12,11 @@
 #define ALT_SCREEN_OFF "\x1b[?1049l"
 #define CURSOR_HIDE "\x1b[?25l"
 #define CURSOR_SHOW "\x1b[?25h"
+
+/* Mouse reporting: 1003 = report every event including plain movement,
+   1006 = SGR encoding (clean, works on wide screens). Off reverses both. */
+#define MOUSE_ON "\x1b[?1003h\x1b[?1006h"
+#define MOUSE_OFF "\x1b[?1006l\x1b[?1003l"
 #define CLEAR_SCREEN "\x1b[2J"
 #define RESET_COLOURS "\x1b[0m"
 
@@ -39,6 +44,7 @@ typedef struct {
 
 static struct termios orig_terminal;
 static int raw_enabled = 0;
+static int mouse_enabled = 0;
 
 static int rows, cols;
 static char *glyphs; /* rows x cols grid of the character on each cell */
@@ -63,16 +69,28 @@ static void frame_append(const char *s, size_t len) {
   frame_len += len;
 }
 
-/* Best-effort write used during setup/teardown, where we can't call die(). */
 static void write_str(const char *s) {
   ssize_t r = write(STDOUT_FILENO, s, strlen(s));
   (void)r;
 }
 
+/* Undo everything we changed. Must never call die(), because it runs from
+   die() and from atexit(). */
 static void restore_terminal(void) {
   if (!raw_enabled)
     return;
   raw_enabled = 0;
+
+  if (mouse_enabled) {
+    /* Stop mouse reports, then give the terminal a moment so any report
+       already on its way arrives before TCSAFLUSH throws pending input away.
+       Otherwise stray "\x1b[<35;10;5M" junk can land on the shell prompt. */
+    write_str(MOUSE_OFF);
+    struct timespec ts = {0, 30 * 1000000L};
+    nanosleep(&ts, NULL);
+    mouse_enabled = 0;
+  }
+
   write_str(RESET_COLOURS CURSOR_SHOW ALT_SCREEN_OFF);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_terminal);
 }
@@ -81,6 +99,12 @@ static void die(const char *func) {
   restore_terminal(); /* back on the normal screen so the error is visible */
   perror(func);
   exit(1);
+}
+
+/* Ask the terminal to report mouse clicks, wheel and movement as input. */
+static void enable_mouse(void) {
+  write_str(MOUSE_ON);
+  mouse_enabled = 1;
 }
 
 static void enable_raw_mode(void) {
@@ -189,8 +213,36 @@ static void update_drop(Drop *d) {
     reset_drop(d, START_DELAY_MAX);
 }
 
-int main(void) {
+static void usage(const char *prog) {
+  fprintf(stderr,
+          "Usage: %s [-s]\n"
+          "  -s  screensaver mode: exit on any key press or mouse event\n",
+          prog);
+}
+
+int main(int argc, char *argv[]) {
+  int screensaver = 0;
+  int opt;
+  while ((opt = getopt(argc, argv, "s")) != -1) {
+    switch (opt) {
+    case 's':
+      screensaver = 1;
+      break;
+    default:
+      usage(argv[0]);
+      return EXIT_FAILURE;
+    }
+  }
+  if (optind < argc) {
+    usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  /* Options are checked before touching the terminal, so a typo just
+     prints the usage message on a normal screen. */
   enable_raw_mode();
+  if (screensaver)
+    enable_mouse();
   srand((unsigned)time(NULL));
   get_window_size(&rows, &cols);
 
@@ -206,22 +258,26 @@ int main(void) {
   }
 
   while (1) {
-
+    /* 1. Input. Normal mode: quit on 'q', ignore everything else.
+          Screensaver mode: any byte at all (key, Enter, arrow key, mouse
+          report) means quit. Drain everything that's waiting either way. */
     char c;
     ssize_t n;
     int quit = 0;
     while ((n = read(STDIN_FILENO, &c, 1)) == 1)
-      if (c == 'q')
+      if (screensaver || c == 'q')
         quit = 1;
     if (n == -1 && errno != EAGAIN)
       die("read");
     if (quit)
       break;
 
+    /* 2. Update every column, collecting all drawing into one frame. */
     frame_len = 0;
     for (int i = 0; i < ndrops; i++)
       update_drop(&drops[i]);
 
+    /* 3. Send the frame in one go. */
     if (frame_len > 0 && write(STDOUT_FILENO, frame, frame_len) == -1)
       die("write");
 
@@ -231,5 +287,5 @@ int main(void) {
   free(drops);
   free(glyphs);
   free(frame);
-  return EXIT_SUCCESS;
+  return EXIT_SUCCESS; /* atexit -> restore_terminal() */
 }
