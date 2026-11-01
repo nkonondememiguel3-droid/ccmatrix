@@ -15,30 +15,59 @@
 #define CLEAR_SCREEN "\x1b[2J"
 #define RESET_COLOURS "\x1b[0m"
 
+/* Colours (SGR sequences). Each one resets first so attributes don't leak. */
 #define COLOUR_HEAD "\x1b[0;1;37m"       /* bold white */
 #define COLOUR_TRAIL_NEAR "\x1b[0;1;32m" /* bold (bright) green */
 #define COLOUR_TRAIL_MID "\x1b[0;32m"    /* normal green */
 #define COLOUR_TRAIL_FAR "\x1b[0;2;32m"  /* dim green */
 
-#define FRAME_DELAY_MS 60
-#define TRAIL_MIN 6
-#define TRAIL_MAX 16
+#define TICK_MS 20  /* one frame of the main loop */
+#define SPEED_MIN 1 /* fastest: move every tick */
+#define SPEED_MAX 5 /* slowest: move every 5 ticks */
+#define TRAIL_MIN 4
+#define START_DELAY_MAX 150 /* ticks a column may wait before (re)starting */
+#define COLUMN_GAP 2        /* use every 2nd column, like cmatrix; 1 = all */
+
+typedef struct {
+  int col;  /* screen column, 1-based */
+  int head; /* row of the leading character; may be off-screen */
+  int trail_len;
+  int speed;   /* move down once every `speed` ticks */
+  int counter; /* ticks since the last move */
+  int wait;    /* ticks left before this drop starts falling */
+} Drop;
 
 static struct termios orig_terminal;
 static int raw_enabled = 0;
 
-/* buffer: build a whole frame, send it in one write */
-static char frame[8192];
-static size_t frame_len = 0;
+static int rows, cols;
+static char *glyphs; /* rows x cols grid of the character on each cell */
+
+static char *frame = NULL;
+static size_t frame_len = 0, frame_cap = 0;
+
+static void die(const char *func);
 
 static void frame_append(const char *s, size_t len) {
-  if (frame_len + len > sizeof(frame))
-    return; /* frame too big; drop the rest rather than overflow */
+  if (frame_len + len > frame_cap) {
+    size_t new_cap = frame_cap ? frame_cap * 2 : 16384;
+    while (new_cap < frame_len + len)
+      new_cap *= 2;
+    char *p = realloc(frame, new_cap);
+    if (!p)
+      die("realloc");
+    frame = p;
+    frame_cap = new_cap;
+  }
   memcpy(frame + frame_len, s, len);
   frame_len += len;
 }
 
-static void write_str(const char *s) { write(STDOUT_FILENO, s, strlen(s)); }
+/* Best-effort write used during setup/teardown, where we can't call die(). */
+static void write_str(const char *s) {
+  ssize_t r = write(STDOUT_FILENO, s, strlen(s));
+  (void)r;
+}
 
 static void restore_terminal(void) {
   if (!raw_enabled)
@@ -75,12 +104,25 @@ static void enable_raw_mode(void) {
   write_str(ALT_SCREEN_ON CURSOR_HIDE CLEAR_SCREEN);
 }
 
-static void get_window_size(int *rows, int *cols) {
+static void get_window_size(int *r, int *c) {
   struct winsize ws;
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
     die("ioctl(TIOCGWINSZ)");
-  *rows = ws.ws_row;
-  *cols = ws.ws_col;
+  *r = ws.ws_row;
+  *c = ws.ws_col;
+}
+
+static int rand_between(int lo, int hi) { return lo + rand() % (hi - lo + 1); }
+
+static char random_glyph(void) { return (char)('!' + rand() % 94); }
+
+static char *cell(int row, int col) {
+  return &glyphs[(size_t)(row - 1) * cols + (col - 1)];
+}
+
+static void sleep_ms(long ms) {
+  struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+  nanosleep(&ts, NULL);
 }
 
 /* Queue character c at (row, col) in the given colour; 1-based coordinates. */
@@ -99,70 +141,95 @@ static const char *trail_colour(int distance, int trail_len) {
   return COLOUR_TRAIL_MID;
 }
 
-static char random_glyph(void) { return (char)('!' + rand() % 94); }
+/* Give a drop fresh random settings and put it back above the screen. */
+static void reset_drop(Drop *d, int max_initial_wait) {
+  d->head = 1;
+  d->trail_len =
+      rand_between(TRAIL_MIN, rows > TRAIL_MIN * 2 ? rows * 2 / 3 : TRAIL_MIN);
+  d->speed = rand_between(SPEED_MIN, SPEED_MAX);
+  d->counter = 0;
+  d->wait = rand_between(0, max_initial_wait);
+}
 
-static void sleep_ms(long ms) {
-  struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
-  nanosleep(&ts, NULL);
+/* Queue the head, trail and trailing blank for one drop. */
+static void draw_drop(const Drop *d) {
+  if (d->head <= rows) {
+    *cell(d->head, d->col) = random_glyph();
+    draw_at(d->head, d->col, COLOUR_HEAD, *cell(d->head, d->col));
+  }
+
+  for (int dist = 1; dist <= d->trail_len; dist++) {
+    int row = d->head - dist;
+    if (row >= 1 && row <= rows)
+      draw_at(row, d->col, trail_colour(dist, d->trail_len),
+              *cell(row, d->col));
+  }
+
+  int blank = d->head - d->trail_len - 1;
+  if (blank >= 1 && blank <= rows)
+    draw_at(blank, d->col, RESET_COLOURS, ' ');
+}
+
+/* Advance one drop by one tick; draw it only if it moved. */
+static void update_drop(Drop *d) {
+  if (d->wait > 0) {
+    d->wait--;
+    return;
+  }
+
+  if (++d->counter < d->speed)
+    return;
+  d->counter = 0;
+
+  draw_drop(d);
+  d->head++;
+
+  /* Whole trail (and the blank after it) has left the screen: start over. */
+  if (d->head - d->trail_len - 1 > rows)
+    reset_drop(d, START_DELAY_MAX);
 }
 
 int main(void) {
   enable_raw_mode();
   srand((unsigned)time(NULL));
-
-  int rows, cols;
   get_window_size(&rows, &cols);
 
-  char *glyphs = calloc((size_t)rows + 1, 1);
-  if (!glyphs)
+  glyphs = calloc((size_t)rows * cols, 1);
+  int ndrops = (cols + COLUMN_GAP - 1) / COLUMN_GAP;
+  Drop *drops = calloc((size_t)ndrops, sizeof(Drop));
+  if (!glyphs || !drops)
     die("calloc");
 
-  int col = rand() % cols + 1;
-  int head = 1;
-  int trail_len = TRAIL_MIN + rand() % (TRAIL_MAX - TRAIL_MIN + 1);
+  for (int i = 0; i < ndrops; i++) {
+    drops[i].col = 1 + i * COLUMN_GAP;
+    reset_drop(&drops[i], START_DELAY_MAX);
+  }
 
   while (1) {
 
     char c;
-    ssize_t n = read(STDIN_FILENO, &c, 1);
+    ssize_t n;
+    int quit = 0;
+    while ((n = read(STDIN_FILENO, &c, 1)) == 1)
+      if (c == 'q')
+        quit = 1;
     if (n == -1 && errno != EAGAIN)
       die("read");
-    if (n == 1 && c == 'q')
+    if (quit)
       break;
 
-    /* Draw the head, the trail behind it, and blank the cell after it. */
     frame_len = 0;
+    for (int i = 0; i < ndrops; i++)
+      update_drop(&drops[i]);
 
-    if (head <= rows) {
-      glyphs[head] = random_glyph();
-      draw_at(head, col, COLOUR_HEAD, glyphs[head]);
-    }
-
-    for (int d = 1; d <= trail_len; d++) {
-      int row = head - d;
-      if (row >= 1 && row <= rows)
-        draw_at(row, col, trail_colour(d, trail_len), glyphs[row]);
-    }
-
-    int tail_end = head - trail_len - 1;
-    if (tail_end >= 1 && tail_end <= rows)
-      draw_at(tail_end, col, RESET_COLOURS, ' ');
-
-    if (write(STDOUT_FILENO, frame, frame_len) == -1)
+    if (frame_len > 0 && write(STDOUT_FILENO, frame, frame_len) == -1)
       die("write");
 
-    /* Move down. Keep going until the whole trail has left the screen,
-          then start a new drop in a new column. */
-    head++;
-    if (head - trail_len - 1 > rows) {
-      head = 1;
-      col = rand() % cols + 1;
-      trail_len = TRAIL_MIN + rand() % (TRAIL_MAX - TRAIL_MIN + 1);
-    }
-
-    sleep_ms(FRAME_DELAY_MS);
+    sleep_ms(TICK_MS);
   }
 
+  free(drops);
   free(glyphs);
+  free(frame);
   return EXIT_SUCCESS;
 }
