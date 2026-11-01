@@ -26,9 +26,11 @@
 #define COLOUR_TRAIL_MID "\x1b[0;32m"    /* normal green */
 #define COLOUR_TRAIL_FAR "\x1b[0;2;32m"  /* dim green */
 
-#define TICK_MS 20  /* one frame of the main loop */
-#define SPEED_MIN 1 /* fastest: move every tick */
-#define SPEED_MAX 5 /* slowest: move every 5 ticks */
+#define UPDATE_DEFAULT 4 /* -u default; tick = update * 10 ms, like cmatrix */
+#define UPDATE_MAX 10
+#define TICK_MIN_MS 1 /* floor for -u 0, so we don't spin at 100% CPU */
+#define SPEED_MIN 1   /* fastest drop: move every tick */
+#define SPEED_MAX 3   /* slowest drop: move every 3 ticks */
 #define TRAIL_MIN 4
 #define START_DELAY_MAX 150 /* ticks a column may wait before (re)starting */
 #define COLUMN_GAP 2        /* use every 2nd column, like cmatrix; 1 = all */
@@ -69,6 +71,7 @@ static void frame_append(const char *s, size_t len) {
   frame_len += len;
 }
 
+/* Best-effort write used during setup/teardown, where we can't call die(). */
 static void write_str(const char *s) {
   ssize_t r = write(STDOUT_FILENO, s, strlen(s));
   (void)r;
@@ -215,18 +218,47 @@ static void update_drop(Drop *d) {
 
 static void usage(const char *prog) {
   fprintf(stderr,
-          "Usage: %s [-s]\n"
-          "  -s  screensaver mode: exit on any key press or mouse event\n",
-          prog);
+          "Usage: %s [-s] [-u delay]\n"
+          "  -s        screensaver mode: exit on any key press or mouse event\n"
+          "  -u delay  update delay, 0 (fastest) to 10 (slowest); default %d\n"
+          "            while running, press 0-9 to change it\n",
+          prog, UPDATE_DEFAULT);
+}
+
+/* Parse a whole-number string in [0, UPDATE_MAX]. Returns -1 if it is empty,
+   has trailing junk ("4x", "fast"), overflows, or is out of range. */
+static int parse_update(const char *s) {
+  char *end;
+  errno = 0;
+  long v = strtol(s, &end, 10);
+  if (end == s || *end != '\0' || errno == ERANGE || v < 0 || v > UPDATE_MAX)
+    return -1;
+  return (int)v;
+}
+
+static long tick_ms_for(int update) {
+  long ms = update * 10L;
+  return ms < TICK_MIN_MS ? TICK_MIN_MS : ms;
 }
 
 int main(int argc, char *argv[]) {
   int screensaver = 0;
+  int update = UPDATE_DEFAULT;
   int opt;
-  while ((opt = getopt(argc, argv, "s")) != -1) {
+  while ((opt = getopt(argc, argv, "su:")) != -1) {
     switch (opt) {
     case 's':
       screensaver = 1;
+      break;
+    case 'u':
+      update = parse_update(optarg);
+      if (update == -1) {
+        fprintf(stderr,
+                "%s: invalid delay '%s' for -u: must be a whole number "
+                "from 0 to %d\n",
+                argv[0], optarg, UPDATE_MAX);
+        return EXIT_FAILURE;
+      }
       break;
     default:
       usage(argv[0]);
@@ -258,15 +290,18 @@ int main(int argc, char *argv[]) {
   }
 
   while (1) {
-    /* 1. Input. Normal mode: quit on 'q', ignore everything else.
-          Screensaver mode: any byte at all (key, Enter, arrow key, mouse
-          report) means quit. Drain everything that's waiting either way. */
+    /* 1. Input. Normal mode: 'q' quits, '0'-'9' set the speed, everything
+          else is ignored. Screensaver mode: any byte at all (key, Enter,
+          arrow key, mouse report) means quit. Drain everything waiting. */
     char c;
     ssize_t n;
     int quit = 0;
-    while ((n = read(STDIN_FILENO, &c, 1)) == 1)
+    while ((n = read(STDIN_FILENO, &c, 1)) == 1) {
       if (screensaver || c == 'q')
         quit = 1;
+      else if (c >= '0' && c <= '9')
+        update = c - '0'; /* takes effect on this very tick */
+    }
     if (n == -1 && errno != EAGAIN)
       die("read");
     if (quit)
@@ -281,7 +316,7 @@ int main(int argc, char *argv[]) {
     if (frame_len > 0 && write(STDOUT_FILENO, frame, frame_len) == -1)
       die("write");
 
-    sleep_ms(TICK_MS);
+    sleep_ms(tick_ms_for(update));
   }
 
   free(drops);
