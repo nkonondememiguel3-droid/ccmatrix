@@ -1,0 +1,4 @@
+# Add to ~/.screenrc: GNU screen runs ccmatrix after 5 idle minutes.
+# Any key brings you back.
+blankerprg ccmatrix -s
+idle 300 blanker

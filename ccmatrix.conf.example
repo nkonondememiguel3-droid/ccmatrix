@@ -1,0 +1,38 @@
+# ccmatrix configuration
+#
+# Copy to ~/.config/ccmatrix/config (or point $CCMATRIX_CONFIG at it).
+# One "key = value" per line; lines starting with # are comments.
+# Anything given on the command line overrides what is set here.
+
+# Update delay, 0 (fastest) to 10 (slowest). Same as -u.
+delay = 4
+
+# Trail colour: green red blue white yellow cyan magenta black. Same as -C.
+colour = green
+
+# Rainbow trails (overrides colour). Same as -r.
+rainbow = no
+
+# Half-width katakana instead of letters and digits. Same as -c.
+katakana = yes
+
+# Exit on any key or mouse movement. Same as -s.
+screensaver = no
+
+# How often trail characters change as they fall, 0-100 (0 = never).
+# Same as -F.
+flicker = 6
+
+# Message mode: the rain resolves into each line of this file in turn.
+# Same as -p. "~/" means your home directory; a relative path is relative
+# to the directory this config file is in.
+message_file = ~/dev/challenges/ccmatrix/assets/spaum51.txt
+
+# Colour of the resolved message text.
+message_colour = white
+
+# Seconds of plain rain between two messages.
+message_interval = 8
+
+# Seconds a resolved message stays on screen before dissolving.
+message_hold = 5

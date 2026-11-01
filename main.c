@@ -1,3 +1,8 @@
+/* ccmatrix - a cmatrix clone with message mode.
+ *
+ * Settings come from built-in defaults, then the config file, then the
+ * command line; later sources win. See usage() and README.md.
+ */
 #define _DEFAULT_SOURCE
 #include <errno.h>
 #include <signal.h>
@@ -5,11 +10,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "config.h"
+#include "text.h"
 
 #define ALT_SCREEN_ON "\x1b[?1049h"
 #define ALT_SCREEN_OFF "\x1b[?1049l"
@@ -26,31 +33,6 @@
 /* SGR intensity codes. */
 enum { BOLD = 1, DIM = 2, NORMAL = 22 };
 
-/* SGR foreground colour codes. */
-enum {
-  FG_BLACK = 30,
-  FG_RED,
-  FG_GREEN,
-  FG_YELLOW,
-  FG_BLUE,
-  FG_MAGENTA,
-  FG_CYAN,
-  FG_WHITE,
-  FG_DEFAULT = 39
-};
-
-static const struct {
-  const char *name;
-  int fg;
-} colour_names[] = {
-    {"green", FG_GREEN},     {"red", FG_RED},       {"blue", FG_BLUE},
-    {"white", FG_WHITE},     {"yellow", FG_YELLOW}, {"cyan", FG_CYAN},
-    {"magenta", FG_MAGENTA}, {"black", FG_BLACK},
-};
-#define N_COLOURS (sizeof(colour_names) / sizeof(colour_names[0]))
-
-#define UPDATE_DEFAULT 4 /* -u default; tick = update * 10 ms, like cmatrix */
-#define UPDATE_MAX 10
 #define TICK_MIN_MS 1 /* floor for -u 0, so we don't spin at 100% CPU */
 #define SPEED_MIN 1   /* fastest drop: move every tick */
 #define SPEED_MAX 3   /* slowest drop: move every 3 ticks */
@@ -62,6 +44,15 @@ static const struct {
 #define KATAKANA_FIRST 0xFF66
 #define KATAKANA_LAST 0xFF9D
 
+/* Screensaver: ignore input this long after starting, so the key press or
+   mouse nudge that launched us doesn't immediately close us again. */
+#define SCREENSAVER_GRACE_MS 500
+
+/* Message mode timings (the rest come from Options). */
+#define MSG_REVEAL_MAX_MS 4000 /* force any unrevealed letters after this */
+#define MSG_DISSOLVE_MS 1500   /* letters drop back into the rain over this */
+#define MSG_KICK_WAIT_MAX 15   /* idle columns over the text start this soon */
+
 typedef struct {
   int col;  /* screen column, 1-based */
   int head; /* row the head is drawn on; 0 = not started yet */
@@ -70,6 +61,19 @@ typedef struct {
   int counter; /* ticks since the last move */
   int wait;    /* ticks left before this drop starts falling */
 } Drop;
+
+/* One character of the message, placed on screen. */
+typedef struct {
+  int row, col, width;
+  uint32_t cp;
+  int revealed;   /* currently shown, blocking the rain */
+  int gone;       /* already dissolved; don't reveal again */
+  long release_at; /* ms into the dissolve phase when it disappears */
+} MsgGlyph;
+
+typedef enum { PH_RAIN, PH_REVEAL, PH_HOLD, PH_DISSOLVE } Phase;
+
+static Options opt;
 
 static struct termios orig_terminal;
 static int raw_enabled = 0;
@@ -81,9 +85,15 @@ static unsigned char *cell_fgs; /* rows x cols: trail colour of each cell */
 static Drop *drops;
 static int ndrops;
 
-static int trail_fg = FG_GREEN; /* -C */
-static int rainbow = 0;         /* -r */
-static int katakana = 0;        /* -c */
+/* Message mode state. */
+static int msg_enabled = 0;
+static TextFile msg_text;
+static size_t msg_line = 0;
+static Phase phase = PH_RAIN;
+static long phase_start = 0;
+static MsgGlyph *mg = NULL;
+static int mg_count = 0, mg_cap = 0, mg_unrevealed = 0;
+static int *msg_map = NULL; /* rows x cols: index into mg, or -1 */
 
 /* Set from signal handlers, checked by the main loop. */
 static volatile sig_atomic_t got_resize = 0;
@@ -93,6 +103,8 @@ static char *frame = NULL;
 static size_t frame_len = 0, frame_cap = 0;
 
 static void die(const char *func);
+
+/* ---------- output ----------------------------------------------------- */
 
 static void frame_append(const char *s, size_t len) {
   if (frame_len + len > frame_cap) {
@@ -132,6 +144,8 @@ static void flush_frame(void) {
 }
 
 static void write_str(const char *s) { (void)write_all(s, strlen(s)); }
+
+/* ---------- terminal setup / teardown ---------------------------------- */
 
 /* Undo everything we changed. Must never call die(), because it runs from
    die() and from atexit(). */
@@ -199,6 +213,8 @@ static int get_window_size(int *r, int *c) {
   return 0;
 }
 
+/* ---------- signals ---------------------------------------------------- */
+
 static void on_resize(int sig) {
   (void)sig;
   got_resize = 1;
@@ -227,10 +243,18 @@ static void install_signal_handlers(void) {
     die("sigaction");
 }
 
+/* ---------- helpers ---------------------------------------------------- */
+
 static int rand_between(int lo, int hi) { return lo + rand() % (hi - lo + 1); }
 
+static long now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
 static uint16_t random_glyph(void) {
-  if (katakana)
+  if (opt.katakana)
     return (uint16_t)rand_between(KATAKANA_FIRST, KATAKANA_LAST);
   return (uint16_t)rand_between('!', '~'); /* printable ASCII */
 }
@@ -243,32 +267,17 @@ static unsigned char *cell_fg(int row, int col) {
   return &cell_fgs[(size_t)(row - 1) * cols + (col - 1)];
 }
 
-/* Encode a code point below U+10000 as UTF-8. Returns the byte count. */
-static int utf8_encode(uint16_t cp, char out[3]) {
-  if (cp < 0x80) {
-    out[0] = (char)cp;
-    return 1;
-  }
-  if (cp < 0x800) {
-    out[0] = (char)(0xC0 | (cp >> 6));
-    out[1] = (char)(0x80 | (cp & 0x3F));
-    return 2;
-  }
-  out[0] = (char)(0xE0 | (cp >> 12));
-  out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-  out[2] = (char)(0x80 | (cp & 0x3F));
-  return 3;
-}
-
 static void sleep_ms(long ms) {
   struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
   nanosleep(&ts, NULL); /* may return early on a signal; that's fine */
 }
 
+/* ---------- drawing ---------------------------------------------------- */
+
 /* Queue code point cp at (row, col); 1-based coordinates.
    intensity is an SGR code (BOLD, NORMAL or DIM), fg a foreground colour code
    (30-37, or FG_DEFAULT). The leading 0 resets so attributes never leak. */
-static void draw_at(int row, int col, int intensity, int fg, uint16_t cp) {
+static void draw_at(int row, int col, int intensity, int fg, uint32_t cp) {
   char buf[48];
   int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[0;%d;%dm", row, col,
                      intensity, fg);
@@ -287,9 +296,9 @@ static int trail_intensity(int distance, int trail_len) {
 
 /* Colour for a cell the head has just reached: fixed, or random in -r mode. */
 static unsigned char pick_trail_fg(void) {
-  if (rainbow)
+  if (opt.rainbow)
     return (unsigned char)rand_between(FG_RED, FG_CYAN); /* 31..36 */
-  return (unsigned char)trail_fg;
+  return (unsigned char)opt.trail_fg;
 }
 
 /* Give a cell a fresh glyph and colour. */
@@ -297,6 +306,256 @@ static void fill_cell(int row, int col) {
   *cell(row, col) = random_glyph();
   *cell_fg(row, col) = pick_trail_fg();
 }
+
+/* ---------- message mode ----------------------------------------------- */
+
+/* True if a resolved message letter is sitting on this cell; the rain must
+   not draw there or it would break the letter (or half of a wide one). */
+static int msg_covers(int row, int col) {
+  if (!msg_map)
+    return 0;
+  int idx = msg_map[(size_t)(row - 1) * cols + (col - 1)];
+  return idx >= 0 && mg[idx].revealed;
+}
+
+static void msg_clear(void) {
+  mg_count = 0;
+  mg_unrevealed = 0;
+  if (msg_map)
+    for (size_t i = 0; i < (size_t)rows * cols; i++)
+      msg_map[i] = -1;
+}
+
+static void msg_add(int row, int col, int width, uint32_t cp) {
+  if (col < 1 || col + width - 1 > cols || row < 1 || row > rows)
+    return;
+  if (mg_count == mg_cap) {
+    int new_cap = mg_cap ? mg_cap * 2 : 64;
+    MsgGlyph *p = realloc(mg, (size_t)new_cap * sizeof(MsgGlyph));
+    if (!p)
+      die("realloc");
+    mg = p;
+    mg_cap = new_cap;
+  }
+  MsgGlyph *g = &mg[mg_count];
+  g->row = row;
+  g->col = col;
+  g->width = width;
+  g->cp = cp;
+  g->revealed = 0;
+  g->gone = 0;
+  g->release_at = 0;
+  for (int c = col; c < col + width; c++)
+    msg_map[(size_t)(row - 1) * cols + (c - 1)] = mg_count;
+  mg_count++;
+  mg_unrevealed++;
+}
+
+/* Lay the current message line out in the middle of the screen, wrapping
+   it to the window width. Japanese has no spaces, so it is broken between
+   any two characters; text with spaces is broken at the last space. Lines
+   that don't fit vertically are dropped. Nothing is drawn yet. */
+static void msg_layout(void) {
+  msg_clear();
+  const TextLine *line = &msg_text.lines[msg_line];
+  const uint32_t *cp = line->cps;
+  size_t n = line->len;
+  int max_w = cols > 4 ? cols - 2 : cols;
+
+  /* First pass: find where each screen row starts and ends. */
+  enum { MAX_ROWS = 256 };
+  size_t starts[MAX_ROWS], ends[MAX_ROWS];
+  int widths[MAX_ROWS];
+  int nrows = 0;
+
+  size_t i = 0;
+  while (i < n && nrows < rows && nrows < MAX_ROWS) {
+    while (i < n && cp[i] == ' ')
+      i++; /* no leading spaces on a wrapped row */
+    if (i >= n)
+      break;
+
+    size_t start = i, last_space = 0;
+    int w = 0, have_space = 0;
+    while (i < n) {
+      int cw = char_width(cp[i]);
+      if (w + cw > max_w)
+        break;
+      if (cp[i] == ' ') {
+        last_space = i;
+        have_space = 1;
+      }
+      w += cw;
+      i++;
+    }
+
+    size_t end = i;
+    if (i < n && have_space && last_space > start) {
+      end = last_space; /* break at the space instead of mid-word */
+      i = last_space + 1;
+    }
+    if (end == start) { /* a single character wider than the window */
+      end = start + 1;
+      i = start + 1;
+    }
+
+    while (end > start && cp[end - 1] == ' ')
+      end--; /* trailing spaces don't count when centring */
+    int row_w = 0;
+    for (size_t k = start; k < end; k++)
+      row_w += char_width(cp[k]);
+
+    starts[nrows] = start;
+    ends[nrows] = end;
+    widths[nrows] = row_w;
+    nrows++;
+  }
+
+  /* Second pass: place each character, centred. */
+  int top = (rows - nrows) / 2 + 1;
+  for (int r = 0; r < nrows; r++) {
+    int col = (cols - widths[r]) / 2 + 1;
+    /* Start on a rain column so wide letters line up with the drops. */
+    if (COLUMN_GAP == 2 && col % 2 == 0 && col > 1)
+      col--;
+    for (size_t k = starts[r]; k < ends[r]; k++) {
+      int w = char_width(cp[k]);
+      if (w == 0)
+        continue;
+      msg_add(top + r, col, w, cp[k]);
+      col += w;
+    }
+  }
+}
+
+static void msg_draw_glyph(int i) {
+  draw_at(mg[i].row, mg[i].col, BOLD, opt.message_fg, mg[i].cp);
+}
+
+static void msg_reveal(int i) {
+  if (mg[i].revealed || mg[i].gone)
+    return;
+  mg[i].revealed = 1;
+  mg_unrevealed--;
+  msg_draw_glyph(i);
+}
+
+/* Remove a letter, blanking every cell it covered, and hand those cells
+   back to the rain. */
+static void msg_dissolve_glyph(int i) {
+  for (int c = mg[i].col; c < mg[i].col + mg[i].width; c++)
+    draw_at(mg[i].row, c, NORMAL, FG_DEFAULT, ' ');
+  mg[i].revealed = 0;
+  mg[i].gone = 1;
+}
+
+/* Reveal the letter under a drop's head, if any. A drop "owns" its column
+   and the gap column(s) to its right, so every letter is reachable. */
+static void msg_reveal_under(const Drop *d) {
+  if (phase != PH_REVEAL || d->head < 1 || d->head > rows)
+    return;
+  for (int c = d->col; c < d->col + COLUMN_GAP && c <= cols; c++) {
+    int idx = msg_map[(size_t)(d->head - 1) * cols + (c - 1)];
+    if (idx >= 0)
+      msg_reveal(idx);
+  }
+}
+
+static void msg_start_reveal(void) {
+  msg_layout();
+  if (mg_count == 0)
+    return;
+
+  /* Columns over the text that are idle get started soon, so the letters
+     are revealed by falling drops rather than the timeout. */
+  int min_c = cols, max_c = 1;
+  for (int i = 0; i < mg_count; i++) {
+    if (mg[i].col < min_c)
+      min_c = mg[i].col;
+    if (mg[i].col + mg[i].width - 1 > max_c)
+      max_c = mg[i].col + mg[i].width - 1;
+  }
+  for (int i = 0; i < ndrops; i++) {
+    Drop *d = &drops[i];
+    if (d->col + COLUMN_GAP - 1 >= min_c && d->col <= max_c && d->head == 0 &&
+        d->wait > MSG_KICK_WAIT_MAX)
+      d->wait = rand_between(0, MSG_KICK_WAIT_MAX);
+  }
+}
+
+static void set_phase(Phase p, long now) {
+  phase = p;
+  phase_start = now;
+}
+
+/* Advance the message state machine:
+   RAIN -> REVEAL (drops uncover letters) -> HOLD -> DISSOLVE -> RAIN. */
+static void msg_tick(long now) {
+  long elapsed = now - phase_start;
+
+  switch (phase) {
+  case PH_RAIN:
+    if (elapsed >= opt.message_interval_ms) {
+      msg_start_reveal();
+      set_phase(PH_REVEAL, now);
+    }
+    break;
+
+  case PH_REVEAL:
+    if (mg_unrevealed == 0 || elapsed >= MSG_REVEAL_MAX_MS) {
+      for (int i = 0; i < mg_count; i++)
+        msg_reveal(i);
+      set_phase(PH_HOLD, now);
+    }
+    break;
+
+  case PH_HOLD:
+    if (elapsed >= opt.message_hold_ms) {
+      for (int i = 0; i < mg_count; i++)
+        mg[i].release_at = rand_between(0, MSG_DISSOLVE_MS);
+      set_phase(PH_DISSOLVE, now);
+    }
+    break;
+
+  case PH_DISSOLVE: {
+    int remaining = 0;
+    for (int i = 0; i < mg_count; i++) {
+      if (!mg[i].revealed)
+        continue;
+      if (elapsed >= mg[i].release_at)
+        msg_dissolve_glyph(i);
+      else
+        remaining++;
+    }
+    if (remaining == 0) {
+      msg_clear();
+      msg_line = (msg_line + 1) % msg_text.count;
+      set_phase(PH_RAIN, now);
+    }
+    break;
+  }
+  }
+}
+
+/* After a resize: lay the current message out again for the new size. */
+static void msg_on_resize(void) {
+  if (phase == PH_RAIN)
+    return;
+  if (phase == PH_DISSOLVE) { /* nearly done anyway: skip to the next line */
+    msg_clear();
+    msg_line = (msg_line + 1) % msg_text.count;
+    set_phase(PH_RAIN, now_ms());
+    return;
+  }
+  msg_layout();
+  if (phase == PH_HOLD) {
+    for (int i = 0; i < mg_count; i++)
+      mg[i].revealed = 1; /* drawn by apply_size() after the clear */
+    mg_unrevealed = 0;
+  }
+}
+
+/* ---------- rain ------------------------------------------------------- */
 
 /* Give a drop fresh random settings and put it back above the screen. */
 static void reset_drop(Drop *d, int max_initial_wait) {
@@ -309,12 +568,14 @@ static void reset_drop(Drop *d, int max_initial_wait) {
 }
 
 /* Queue the head, trail and trailing blank for one drop at its current
-   position. Only rows inside the window are drawn. */
-static void render_drop(const Drop *d) {
+   position. Only rows inside the window, and not under a message letter,
+   are drawn. With flicker set, some trail cells change character and flash
+   bright for this one frame. */
+static void render_drop(const Drop *d, int flicker) {
   if (d->head == 0 || d->col > cols)
     return;
 
-  if (d->head <= rows) {
+  if (d->head <= rows && !msg_covers(d->head, d->col)) {
     if (*cell(d->head, d->col) == 0) /* row that appeared after a resize */
       fill_cell(d->head, d->col);
     draw_at(d->head, d->col, BOLD, FG_WHITE, *cell(d->head, d->col));
@@ -324,16 +585,21 @@ static void render_drop(const Drop *d) {
     int row = d->head - dist;
     if (row < 1)
       break;
-    if (row > rows)
+    if (row > rows || msg_covers(row, d->col))
       continue;
     if (*cell(row, d->col) == 0) /* row that appeared after a resize */
       fill_cell(row, d->col);
-    draw_at(row, d->col, trail_intensity(dist, d->trail_len),
-            *cell_fg(row, d->col), *cell(row, d->col));
+
+    int intensity = trail_intensity(dist, d->trail_len);
+    if (flicker && opt.flicker > 0 && rand() % 100 < opt.flicker) {
+      *cell(row, d->col) = random_glyph();
+      intensity = BOLD;
+    }
+    draw_at(row, d->col, intensity, *cell_fg(row, d->col), *cell(row, d->col));
   }
 
   int blank = d->head - d->trail_len - 1;
-  if (blank >= 1 && blank <= rows)
+  if (blank >= 1 && blank <= rows && !msg_covers(blank, d->col))
     draw_at(blank, d->col, NORMAL, FG_DEFAULT, ' ');
 }
 
@@ -351,22 +617,28 @@ static void update_drop(Drop *d) {
   d->head++;
   if (d->head <= rows)
     fill_cell(d->head, d->col);
-  render_drop(d);
+  if (msg_enabled)
+    msg_reveal_under(d);
+  render_drop(d, 1);
 
   /* The blank has just cleared the bottom row: the trail is gone. */
   if (d->head - d->trail_len - 1 >= rows)
     reset_drop(d, START_DELAY_MAX);
 }
 
+/* ---------- screen size ------------------------------------------------ */
+
 /* (Re)build the grids and drops for a new window size, keeping as much of
    the running animation as fits. Called once at start (with no old state)
    and again after every resize. */
 static void apply_size(int new_rows, int new_cols) {
-  uint16_t *new_glyphs = calloc((size_t)new_rows * new_cols, sizeof(uint16_t));
-  unsigned char *new_fgs = calloc((size_t)new_rows * new_cols, 1);
+  size_t ncells = (size_t)new_rows * new_cols;
+  uint16_t *new_glyphs = calloc(ncells, sizeof(uint16_t));
+  unsigned char *new_fgs = calloc(ncells, 1);
   int new_ndrops = (new_cols + COLUMN_GAP - 1) / COLUMN_GAP;
   Drop *new_drops = calloc((size_t)new_ndrops, sizeof(Drop));
-  if (!new_glyphs || !new_fgs || !new_drops)
+  int *new_map = msg_enabled ? malloc(ncells * sizeof(int)) : NULL;
+  if (!new_glyphs || !new_fgs || !new_drops || (msg_enabled && !new_map))
     die("calloc");
 
   /* Copy the overlapping part of the old grids. */
@@ -388,9 +660,11 @@ static void apply_size(int new_rows, int new_cols) {
   free(glyphs);
   free(cell_fgs);
   free(drops);
+  free(msg_map);
   glyphs = new_glyphs;
   cell_fgs = new_fgs;
   drops = new_drops;
+  msg_map = new_map;
   ndrops = new_ndrops;
   rows = new_rows;
   cols = new_cols;
@@ -401,12 +675,20 @@ static void apply_size(int new_rows, int new_cols) {
     reset_drop(&drops[i], START_DELAY_MAX);
   }
 
+  if (msg_enabled) {
+    msg_clear();
+    msg_on_resize();
+  }
+
   /* Wipe everything (including fragments the terminal may have reflowed)
-     and redraw every running trail at once, so nothing flickers away. */
+     and redraw every running trail and visible letter at once. */
   frame_len = 0;
   frame_append(RESET_COLOURS CLEAR_SCREEN, strlen(RESET_COLOURS CLEAR_SCREEN));
   for (int i = 0; i < ndrops; i++)
-    render_drop(&drops[i]);
+    render_drop(&drops[i], 0);
+  for (int i = 0; i < mg_count; i++)
+    if (mg[i].revealed)
+      msg_draw_glyph(i);
   flush_frame();
 }
 
@@ -418,43 +700,30 @@ static void handle_resize(void) {
   apply_size(r, c);
 }
 
-static void usage(const char *prog) {
+/* ---------- options ---------------------------------------------------- */
+
+static void usage(FILE *f, const char *prog) {
   fprintf(
-      stderr,
-      "Usage: %s [-s] [-r] [-c] [-u delay] [-C colour]\n"
-      "  -s         screensaver mode: exit on any key press or mouse event\n"
-      "  -u delay   update delay, 0 (fastest) to 10 (slowest); default %d\n"
-      "             while running, press 0-9 to change it\n"
-      "  -C colour  trail colour; default green\n"
-      "  -r         rainbow trails (overrides -C)\n"
-      "  -c         half-width katakana (needs a UTF-8 terminal)\n",
-      prog, UPDATE_DEFAULT);
-}
-
-static void print_colour_list(FILE *f) {
-  fprintf(f, "Supported colours:");
-  for (size_t i = 0; i < N_COLOURS; i++)
-    fprintf(f, " %s", colour_names[i].name);
-  fprintf(f, "\n");
-}
-
-/* Look a colour name up (case-insensitive). Returns its fg code or -1. */
-static int parse_colour(const char *s) {
-  for (size_t i = 0; i < N_COLOURS; i++)
-    if (strcasecmp(s, colour_names[i].name) == 0)
-      return colour_names[i].fg;
-  return -1;
-}
-
-/* Parse a whole-number string in [0, UPDATE_MAX]. Returns -1 if it is empty,
-   has trailing junk ("4x", "fast"), overflows, or is out of range. */
-static int parse_update(const char *s) {
-  char *end;
-  errno = 0;
-  long v = strtol(s, &end, 10);
-  if (end == s || *end != '\0' || errno == ERANGE || v < 0 || v > UPDATE_MAX)
-    return -1;
-  return (int)v;
+      f,
+      "Usage: %s [-s] [-r] [-c] [-u delay] [-C colour] [-p file] [-F percent]"
+      " [-N]\n"
+      "  -s          screensaver mode: exit on any key press or mouse event\n"
+      "  -u delay    update delay, 0 (fastest) to 10 (slowest); default %d\n"
+      "              while running, press 0-9 to change it\n"
+      "  -C colour   trail colour; default green\n"
+      "  -r          rainbow trails (overrides -C)\n"
+      "  -c          half-width katakana (needs a UTF-8 terminal)\n"
+      "  -p file     message mode: the rain resolves into each line of file\n"
+      "              in turn (UTF-8; Japanese and other wide text work)\n"
+      "  -F percent  how often trail characters flicker, 0 to 100; "
+      "default %d\n"
+      "  -N          ignore the config file\n"
+      "  -h          show this help\n"
+      "\n"
+      "Settings are also read from $CCMATRIX_CONFIG, or else\n"
+      "$XDG_CONFIG_HOME/ccmatrix/config (~/.config/ccmatrix/config).\n"
+      "Command-line options override the config file.\n",
+      prog, UPDATE_DEFAULT, FLICKER_DEFAULT);
 }
 
 static long tick_ms_for(int update) {
@@ -462,99 +731,197 @@ static long tick_ms_for(int update) {
   return ms < TICK_MIN_MS ? TICK_MIN_MS : ms;
 }
 
-int main(int argc, char *argv[]) {
-  int screensaver = 0;
-  int update = UPDATE_DEFAULT;
-  int opt;
-  while ((opt = getopt(argc, argv, "su:C:rc")) != -1) {
-    switch (opt) {
+#define OPTSTRING "su:C:rcp:F:Nh"
+
+/* Returns 0 to continue, or an exit status (+1 so 0 can mean "go on"). */
+static int parse_args(int argc, char *argv[]) {
+  /* Pass 1: only look for -N, which decides whether to read the config. */
+  int use_config = 1;
+  int o;
+  opterr = 0;
+  while ((o = getopt(argc, argv, OPTSTRING)) != -1)
+    if (o == 'N')
+      use_config = 0;
+
+  if (use_config) {
+    char *path = config_default_path();
+    int must_exist = getenv("CCMATRIX_CONFIG") != NULL;
+    int rc = path ? config_load(&opt, path, must_exist) : 0;
+    free(path);
+    if (rc == -1)
+      return 1 + EXIT_FAILURE;
+  }
+
+  /* Pass 2: the real parse; command-line values override the config. */
+  opterr = 1;
+#if defined(__GLIBC__)
+  optind = 0; /* full reset on glibc */
+#else
+  optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||      \
+    defined(__NetBSD__)
+  optreset = 1;
+#endif
+#endif
+  while ((o = getopt(argc, argv, OPTSTRING)) != -1) {
+    int v;
+    switch (o) {
     case 's':
-      screensaver = 1;
+      opt.screensaver = 1;
       break;
     case 'r':
-      rainbow = 1;
+      opt.rainbow = 1;
       break;
     case 'c':
-      katakana = 1;
+      opt.katakana = 1;
       break;
+    case 'N':
+      break;
+    case 'h':
+      usage(stdout, argv[0]);
+      return 1 + EXIT_SUCCESS;
     case 'C':
-      trail_fg = parse_colour(optarg);
-      if (trail_fg == -1) {
+      if ((v = parse_colour(optarg)) == -1) {
         fprintf(stderr, "%s: unknown colour '%s' for -C\n", argv[0], optarg);
         print_colour_list(stderr);
-        return EXIT_FAILURE;
+        return 1 + EXIT_FAILURE;
       }
+      opt.trail_fg = v;
       break;
     case 'u':
-      update = parse_update(optarg);
-      if (update == -1) {
+      if ((v = parse_update(optarg)) == -1) {
         fprintf(stderr,
                 "%s: invalid delay '%s' for -u: must be a whole number "
                 "from 0 to %d\n",
                 argv[0], optarg, UPDATE_MAX);
-        return EXIT_FAILURE;
+        return 1 + EXIT_FAILURE;
+      }
+      opt.update = v;
+      break;
+    case 'F':
+      if ((v = parse_percent(optarg)) == -1) {
+        fprintf(stderr,
+                "%s: invalid flicker '%s' for -F: must be a whole number "
+                "from 0 to 100\n",
+                argv[0], optarg);
+        return 1 + EXIT_FAILURE;
+      }
+      opt.flicker = v;
+      break;
+    case 'p':
+      free(opt.message_file);
+      opt.message_file = strdup(optarg);
+      if (!opt.message_file) {
+        perror("strdup");
+        return 1 + EXIT_FAILURE;
       }
       break;
     default:
-      usage(argv[0]);
-      return EXIT_FAILURE;
+      usage(stderr, argv[0]);
+      return 1 + EXIT_FAILURE;
     }
   }
   if (optind < argc) {
-    usage(argv[0]);
-    return EXIT_FAILURE;
+    usage(stderr, argv[0]);
+    return 1 + EXIT_FAILURE;
+  }
+  return 0;
+}
+
+/* ---------- main ------------------------------------------------------- */
+
+int main(int argc, char *argv[]) {
+  options_defaults(&opt);
+  int rc = parse_args(argc, argv);
+  if (rc) {
+    options_free(&opt);
+    return rc - 1;
   }
 
-  /* Options are checked before touching the terminal, so a typo just
-     prints the usage message on a normal screen. */
+  /* Load the message file before touching the terminal, so any problem is
+     reported on a normal screen. */
+  if (opt.message_file) {
+    int lr = text_load(opt.message_file, &msg_text);
+    if (lr == -1) {
+      fprintf(stderr, "%s: cannot read message file '%s': %s\n", argv[0],
+              opt.message_file, strerror(errno));
+      options_free(&opt);
+      return EXIT_FAILURE;
+    }
+    if (lr == -2) {
+      fprintf(stderr, "%s: message file '%s' has no text in it\n", argv[0],
+              opt.message_file);
+      options_free(&opt);
+      return EXIT_FAILURE;
+    }
+    msg_enabled = 1;
+  }
+
   int r, c;
   if (get_window_size(&r, &c) == -1) {
     fprintf(stderr,
             "%s: cannot get the terminal size (is stdout a terminal?)\n",
             argv[0]);
+    options_free(&opt);
     return EXIT_FAILURE;
   }
 
   enable_raw_mode();
   install_signal_handlers();
-  if (screensaver)
+  if (opt.screensaver)
     enable_mouse();
   srand((unsigned)time(NULL));
   apply_size(r, c);
+
+  long started = now_ms();
+  /* The first message comes after half the usual wait. */
+  set_phase(PH_RAIN, started - opt.message_interval_ms / 2);
 
   while (!got_quit_signal) {
     /* 1. Resize: rebuild for the new size before drawing anything. */
     if (got_resize)
       handle_resize();
 
-    /* 2. Input. Normal mode: 'q' quits, '0'-'9' set the speed, everything
-          else is ignored. Screensaver mode: any byte at all (key, Enter,
-          arrow key, mouse report) means quit. Drain everything waiting. */
+    /* 2. Input. Normal mode: 'q' or Ctrl-C quits, '0'-'9' set the speed,
+          everything else is ignored. Screensaver mode: any byte at all (key,
+          Enter, arrow key, mouse report) means quit, after a short grace
+          period. Drain everything waiting either way. */
     char ch;
     ssize_t n;
     int quit = 0;
+    long now = now_ms();
     while ((n = read(STDIN_FILENO, &ch, 1)) == 1) {
-      if (screensaver || ch == 'q')
+      if (opt.screensaver) {
+        if (now - started >= SCREENSAVER_GRACE_MS)
+          quit = 1;
+      } else if (ch == 'q' || ch == 3) {
         quit = 1;
-      else if (ch >= '0' && ch <= '9')
-        update = ch - '0'; /* takes effect on this very tick */
+      } else if (ch >= '0' && ch <= '9') {
+        opt.update = ch - '0'; /* takes effect on this very tick */
+      }
     }
     if (n == -1 && errno != EAGAIN && errno != EINTR)
       die("read");
     if (quit)
       break;
 
-    /* 3. Update every column, collecting all drawing into one frame. */
+    /* 3. Update every column and the message, then draw in one go. */
     for (int i = 0; i < ndrops; i++)
       update_drop(&drops[i]);
+    if (msg_enabled)
+      msg_tick(now_ms());
     flush_frame();
 
-    sleep_ms(tick_ms_for(update));
+    sleep_ms(tick_ms_for(opt.update));
   }
 
   free(drops);
   free(glyphs);
   free(cell_fgs);
+  free(msg_map);
+  free(mg);
   free(frame);
+  text_free(&msg_text);
+  options_free(&opt);
   return EXIT_SUCCESS; /* atexit -> restore_terminal() */
 }
