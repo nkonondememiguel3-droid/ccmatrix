@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <time.h>
@@ -21,10 +22,31 @@
 #define RESET_COLOURS "\x1b[0m"
 
 /* Colours (SGR sequences). Each one resets first so attributes don't leak. */
-#define COLOUR_HEAD "\x1b[0;1;37m"       /* bold white */
-#define COLOUR_TRAIL_NEAR "\x1b[0;1;32m" /* bold (bright) green */
-#define COLOUR_TRAIL_MID "\x1b[0;32m"    /* normal green */
-#define COLOUR_TRAIL_FAR "\x1b[0;2;32m"  /* dim green */
+/* SGR intensity codes. */
+enum { BOLD = 1, DIM = 2, NORMAL = 22 };
+
+/* SGR foreground colour codes. */
+enum {
+  FG_BLACK = 30,
+  FG_RED,
+  FG_GREEN,
+  FG_YELLOW,
+  FG_BLUE,
+  FG_MAGENTA,
+  FG_CYAN,
+  FG_WHITE,
+  FG_DEFAULT = 39
+};
+
+static const struct {
+  const char *name;
+  int fg;
+} colour_names[] = {
+    {"green", FG_GREEN},     {"red", FG_RED},       {"blue", FG_BLUE},
+    {"white", FG_WHITE},     {"yellow", FG_YELLOW}, {"cyan", FG_CYAN},
+    {"magenta", FG_MAGENTA}, {"black", FG_BLACK},
+};
+#define N_COLOURS (sizeof(colour_names) / sizeof(colour_names[0]))
 
 #define UPDATE_DEFAULT 4 /* -u default; tick = update * 10 ms, like cmatrix */
 #define UPDATE_MAX 10
@@ -49,7 +71,12 @@ static int raw_enabled = 0;
 static int mouse_enabled = 0;
 
 static int rows, cols;
-static char *glyphs; /* rows x cols grid of the character on each cell */
+static char *glyphs; /* rows x cols grid: character on each cell */
+static unsigned char
+    *cell_fgs; /* rows x cols grid: trail colour of each cell */
+
+static int trail_fg = FG_GREEN; /* -C */
+static int rainbow = 0;         /* -r */
 
 static char *frame = NULL;
 static size_t frame_len = 0, frame_cap = 0;
@@ -147,25 +174,39 @@ static char *cell(int row, int col) {
   return &glyphs[(size_t)(row - 1) * cols + (col - 1)];
 }
 
+static unsigned char *cell_fg(int row, int col) {
+  return &cell_fgs[(size_t)(row - 1) * cols + (col - 1)];
+}
+
 static void sleep_ms(long ms) {
   struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
   nanosleep(&ts, NULL);
 }
 
-/* Queue character c at (row, col) in the given colour; 1-based coordinates. */
-static void draw_at(int row, int col, const char *colour, char c) {
+/* Queue character c at (row, col); 1-based coordinates.
+   intensity is an SGR code (BOLD, NORMAL or DIM), fg a foreground colour code
+   (30-37, or FG_DEFAULT). The leading 0 resets so attributes never leak. */
+static void draw_at(int row, int col, int intensity, int fg, char c) {
   char buf[48];
-  int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH%s%c", row, col, colour, c);
+  int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[0;%d;%dm%c", row, col,
+                     intensity, fg, c);
   frame_append(buf, (size_t)len);
 }
 
-/* Pick the trail colour by distance from the head (1 = just behind it). */
-static const char *trail_colour(int distance, int trail_len) {
+/* Pick the trail brightness by distance from the head (1 = just behind it). */
+static int trail_intensity(int distance, int trail_len) {
   if (distance <= 2)
-    return COLOUR_TRAIL_NEAR;
+    return BOLD;
   if (distance > trail_len - trail_len / 3)
-    return COLOUR_TRAIL_FAR;
-  return COLOUR_TRAIL_MID;
+    return DIM;
+  return NORMAL;
+}
+
+/* Colour for a cell the head has just reached: fixed, or random in -r mode. */
+static unsigned char pick_trail_fg(void) {
+  if (rainbow)
+    return (unsigned char)rand_between(FG_RED, FG_CYAN); /* 31..36 */
+  return (unsigned char)trail_fg;
 }
 
 /* Give a drop fresh random settings and put it back above the screen. */
@@ -181,20 +222,23 @@ static void reset_drop(Drop *d, int max_initial_wait) {
 /* Queue the head, trail and trailing blank for one drop. */
 static void draw_drop(const Drop *d) {
   if (d->head <= rows) {
+    /* Choose the glyph and the colour this cell will keep as part of the
+       trail; the head itself is always drawn bold white. */
     *cell(d->head, d->col) = random_glyph();
-    draw_at(d->head, d->col, COLOUR_HEAD, *cell(d->head, d->col));
+    *cell_fg(d->head, d->col) = pick_trail_fg();
+    draw_at(d->head, d->col, BOLD, FG_WHITE, *cell(d->head, d->col));
   }
 
   for (int dist = 1; dist <= d->trail_len; dist++) {
     int row = d->head - dist;
     if (row >= 1 && row <= rows)
-      draw_at(row, d->col, trail_colour(dist, d->trail_len),
-              *cell(row, d->col));
+      draw_at(row, d->col, trail_intensity(dist, d->trail_len),
+              *cell_fg(row, d->col), *cell(row, d->col));
   }
 
   int blank = d->head - d->trail_len - 1;
   if (blank >= 1 && blank <= rows)
-    draw_at(blank, d->col, RESET_COLOURS, ' ');
+    draw_at(blank, d->col, NORMAL, FG_DEFAULT, ' ');
 }
 
 /* Advance one drop by one tick; draw it only if it moved. */
@@ -217,12 +261,30 @@ static void update_drop(Drop *d) {
 }
 
 static void usage(const char *prog) {
-  fprintf(stderr,
-          "Usage: %s [-s] [-u delay]\n"
-          "  -s        screensaver mode: exit on any key press or mouse event\n"
-          "  -u delay  update delay, 0 (fastest) to 10 (slowest); default %d\n"
-          "            while running, press 0-9 to change it\n",
-          prog, UPDATE_DEFAULT);
+  fprintf(
+      stderr,
+      "Usage: %s [-s] [-r] [-u delay] [-C colour]\n"
+      "  -s         screensaver mode: exit on any key press or mouse event\n"
+      "  -u delay   update delay, 0 (fastest) to 10 (slowest); default %d\n"
+      "             while running, press 0-9 to change it\n"
+      "  -C colour  trail colour; default green\n"
+      "  -r         rainbow trails (overrides -C)\n",
+      prog, UPDATE_DEFAULT);
+}
+
+static void print_colour_list(FILE *f) {
+  fprintf(f, "Supported colours:");
+  for (size_t i = 0; i < N_COLOURS; i++)
+    fprintf(f, " %s", colour_names[i].name);
+  fprintf(f, "\n");
+}
+
+/* Look a colour name up (case-insensitive). Returns its fg code or -1. */
+static int parse_colour(const char *s) {
+  for (size_t i = 0; i < N_COLOURS; i++)
+    if (strcasecmp(s, colour_names[i].name) == 0)
+      return colour_names[i].fg;
+  return -1;
 }
 
 /* Parse a whole-number string in [0, UPDATE_MAX]. Returns -1 if it is empty,
@@ -245,10 +307,21 @@ int main(int argc, char *argv[]) {
   int screensaver = 0;
   int update = UPDATE_DEFAULT;
   int opt;
-  while ((opt = getopt(argc, argv, "su:")) != -1) {
+  while ((opt = getopt(argc, argv, "su:C:r")) != -1) {
     switch (opt) {
     case 's':
       screensaver = 1;
+      break;
+    case 'r':
+      rainbow = 1;
+      break;
+    case 'C':
+      trail_fg = parse_colour(optarg);
+      if (trail_fg == -1) {
+        fprintf(stderr, "%s: unknown colour '%s' for -C\n", argv[0], optarg);
+        print_colour_list(stderr);
+        return EXIT_FAILURE;
+      }
       break;
     case 'u':
       update = parse_update(optarg);
@@ -279,9 +352,10 @@ int main(int argc, char *argv[]) {
   get_window_size(&rows, &cols);
 
   glyphs = calloc((size_t)rows * cols, 1);
+  cell_fgs = calloc((size_t)rows * cols, 1);
   int ndrops = (cols + COLUMN_GAP - 1) / COLUMN_GAP;
   Drop *drops = calloc((size_t)ndrops, sizeof(Drop));
-  if (!glyphs || !drops)
+  if (!glyphs || !cell_fgs || !drops)
     die("calloc");
 
   for (int i = 0; i < ndrops; i++) {
@@ -321,6 +395,7 @@ int main(int argc, char *argv[]) {
 
   free(drops);
   free(glyphs);
+  free(cell_fgs);
   free(frame);
   return EXIT_SUCCESS; /* atexit -> restore_terminal() */
 }
