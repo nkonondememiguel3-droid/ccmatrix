@@ -154,8 +154,8 @@ static char *trim(char *s) {
 }
 
 /* Apply one key/value pair. Returns NULL on success, or an error message. */
-static const char *apply_setting(Options *o, const char *key,
-                                 const char *value, const char *config_path) {
+static const char *apply_setting(Options *o, const char *key, const char *value,
+                                 const char *config_path) {
   int v;
   long ms;
 
@@ -209,8 +209,8 @@ static const char *apply_setting(Options *o, const char *key,
 }
 
 int config_load(Options *o, const char *path, int must_exist) {
-  FILE *f = fopen(path, "r");
-  if (!f) {
+  FILE *fd = fopen(path, "r");
+  if (!fd) {
     if (errno == ENOENT && !must_exist)
       return 0;
     fprintf(stderr, "ccmatrix: cannot read config file '%s': %s\n", path,
@@ -220,9 +220,9 @@ int config_load(Options *o, const char *path, int must_exist) {
 
   char line[4096];
   int lineno = 0, ok = 1;
-  while (fgets(line, sizeof(line), f)) {
+  while (fgets(line, sizeof(line), fd)) {
     lineno++;
-    if (!strchr(line, '\n') && !feof(f)) {
+    if (!strchr(line, '\n') && !feof(fd)) {
       fprintf(stderr, "%s:%d: line too long\n", path, lineno);
       ok = 0;
       break;
@@ -265,6 +265,6 @@ int config_load(Options *o, const char *path, int must_exist) {
       ok = 0;
     }
   }
-  fclose(f);
+  fclose(fd);
   return ok ? 0 : -1;
 }

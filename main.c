@@ -1,11 +1,11 @@
 /* ccmatrix - a cmatrix clone with message mode.
  *
- * Settings come from built-in defaults, then the config file, then the
- * command line; later sources win. See usage() and README.md.
+ * AUTHOR: NKONO NDEME Miguel
  */
 #define _DEFAULT_SOURCE
 #include <errno.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,8 +66,8 @@ typedef struct {
 typedef struct {
   int row, col, width;
   uint32_t cp;
-  int revealed;   /* currently shown, blocking the rain */
-  int gone;       /* already dissolved; don't reveal again */
+  int revealed;    /* currently shown, blocking the rain */
+  int gone;        /* already dissolved; don't reveal again */
   long release_at; /* ms into the dissolve phase when it disappears */
 } MsgGlyph;
 
@@ -733,19 +733,18 @@ static long tick_ms_for(int update) {
 
 #define OPTSTRING "su:C:rcp:F:Nh"
 
-/* Returns 0 to continue, or an exit status (+1 so 0 can mean "go on"). */
 static int parse_args(int argc, char *argv[]) {
-  /* Pass 1: only look for -N, which decides whether to read the config. */
-  int use_config = 1;
+  bool use_config = true;
   int o;
   opterr = 0;
+  //   #define OPTSTRING "su:C:rcp:F:Nh"
   while ((o = getopt(argc, argv, OPTSTRING)) != -1)
     if (o == 'N')
-      use_config = 0;
+      use_config = false;
 
-  if (use_config) {
+  if (use_config == true) {
     char *path = config_default_path();
-    int must_exist = getenv("CCMATRIX_CONFIG") != NULL;
+    bool must_exist = getenv("CCMATRIX_CONFIG") != NULL;
     int rc = path ? config_load(&opt, path, must_exist) : 0;
     free(path);
     if (rc == -1)
@@ -828,8 +827,6 @@ static int parse_args(int argc, char *argv[]) {
   return 0;
 }
 
-/* ---------- main ------------------------------------------------------- */
-
 int main(int argc, char *argv[]) {
   options_defaults(&opt);
   int rc = parse_args(argc, argv);
@@ -878,11 +875,11 @@ int main(int argc, char *argv[]) {
   set_phase(PH_RAIN, started - opt.message_interval_ms / 2);
 
   while (!got_quit_signal) {
-    /* 1. Resize: rebuild for the new size before drawing anything. */
+    /* Resize: rebuild for the new size before drawing anything. */
     if (got_resize)
       handle_resize();
 
-    /* 2. Input. Normal mode: 'q' or Ctrl-C quits, '0'-'9' set the speed,
+    /* Input. Normal mode: 'q' or Ctrl-C quits, '0'-'9' set the speed,
           everything else is ignored. Screensaver mode: any byte at all (key,
           Enter, arrow key, mouse report) means quit, after a short grace
           period. Drain everything waiting either way. */
@@ -905,7 +902,7 @@ int main(int argc, char *argv[]) {
     if (quit)
       break;
 
-    /* 3. Update every column and the message, then draw in one go. */
+    /* Update every column and the message, then draw in one go. */
     for (int i = 0; i < ndrops; i++)
       update_drop(&drops[i]);
     if (msg_enabled)

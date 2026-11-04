@@ -5,7 +5,7 @@
 # Anything given on the command line overrides what is set here.
 
 # Update delay, 0 (fastest) to 10 (slowest). Same as -u.
-delay = 4
+delay = 1
 
 # Trail colour: green red blue white yellow cyan magenta black. Same as -C.
 colour = green
@@ -26,13 +26,13 @@ flicker = 6
 # Message mode: the rain resolves into each line of this file in turn.
 # Same as -p. "~/" means your home directory; a relative path is relative
 # to the directory this config file is in.
-message_file = ~/dev/challenges/ccmatrix/assets/spaum51.txt
+message_file = ~/dev/challenges/ccmatrix/assets/spaum91.txt
 
 # Colour of the resolved message text.
 message_colour = white
 
 # Seconds of plain rain between two messages.
-message_interval = 8
+message_interval = 5
 
 # Seconds a resolved message stays on screen before dissolving.
-message_hold = 5
+message_hold = 10
